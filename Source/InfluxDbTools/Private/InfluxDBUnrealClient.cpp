@@ -1,3 +1,4 @@
+// Copyright (c) Iwer Petersen. All rights reserved.
 #include "InfluxDBUnrealClient.h"
 #include "Runtime/Online/HTTP/Public/Http.h"
 #include <chrono>
@@ -38,9 +39,9 @@ void UInfluxDBUnrealClient::TickComponent(float DeltaTime, ELevelTick TickType, 
 	// ...
 }
 
-void UInfluxDBUnrealClient::AddToLineProtocolBuffer(FString string)
+void UInfluxDBUnrealClient::AddToLineProtocolBuffer(FString Line)
 {
-	LineProtocolBuffer.Add(string);
+	LineProtocolBuffer.Add(Line);
 }
 
 void UInfluxDBUnrealClient::DumpLineProtocolBufferToDatabase()
@@ -50,76 +51,86 @@ void UInfluxDBUnrealClient::DumpLineProtocolBufferToDatabase()
 	PostLineProtocolToInfluxDBServer(lines);
 }
 
-FString UInfluxDBUnrealClient::ConvertTransformToLineProtocol(FTransform transform, FString label, bool bIncludeLocation, bool bIncludeRotation, bool bIncludeScale)
+void UInfluxDBUnrealClient::AppendTransform(FString Label, TMap<FString,FString> Tags, FTransform Transform, bool bIncludeLocation, bool bIncludeRotation, bool bIncludeScale)
 {
-	char location_buffer[512] = { 0 };
-	char rotation_buffer[512] = { 0 };
-	char scale3d_buffer[512] = { 0 };
+	TMap<FString,FString> values;
 
 	if (bIncludeLocation)
 	{
-		auto n = sprintf(location_buffer, "location_x=%f,location_y=%f,location_z=%f",
-			transform.GetLocation().X,
-			transform.GetLocation().Y,
-			transform.GetLocation().Z);
+		values.Add(TEXT("location_x"), FString::SanitizeFloat(Transform.GetLocation().X));
+		values.Add(TEXT("location_y"), FString::SanitizeFloat(Transform.GetLocation().Y));
+		values.Add(TEXT("location_z"), FString::SanitizeFloat(Transform.GetLocation().Z));
 	}
 	if (bIncludeRotation)
 	{
-		auto n = sprintf(rotation_buffer, "rotation_x=%f,rotation_y=%f,rotation_z=%f,rotation_w=%f",
-			transform.GetRotation().X,
-			transform.GetRotation().Y,
-			transform.GetRotation().Z,
-			transform.GetRotation().W);
+		values.Add(TEXT("rotation_x"), FString::SanitizeFloat(Transform.GetRotation().X));
+		values.Add(TEXT("rotation_y"), FString::SanitizeFloat(Transform.GetRotation().Y));
+		values.Add(TEXT("rotation_z"), FString::SanitizeFloat(Transform.GetRotation().Z));
+		values.Add(TEXT("rotation_w"), FString::SanitizeFloat(Transform.GetRotation().W));
 	}
 	if (bIncludeScale)
 	{
-		auto n = sprintf(scale3d_buffer, "scale_x=%f,scale_y=%f,scale_z=%f",
-			transform.GetScale3D().X,
-			transform.GetScale3D().Y,
-			transform.GetScale3D().Z);
+		values.Add(TEXT("scale_x"), FString::SanitizeFloat(Transform.GetScale3D().X));
+		values.Add(TEXT("scale_y"), FString::SanitizeFloat(Transform.GetScale3D().Y));
+		values.Add(TEXT("scale_z"), FString::SanitizeFloat(Transform.GetScale3D().Z));
 	}
+	AppendMeasurement(Label, Tags, values);	
+}
+
+FString UInfluxDBUnrealClient::BuildLineProtocol(FString Label, FString Tags, FString Values)
+{
+	return Label + "," + Tags +" " + Values + " " + BuildTimestamp();
+}
+
+void UInfluxDBUnrealClient::BuildAndAddLineProtocolToBuffer(FString Label, FString Tags, FString Values)
+{
+	AddToLineProtocolBuffer(BuildLineProtocol(Label, Tags, Values));
+}
+
+void UInfluxDBUnrealClient::AppendMeasurement(FString Label, TMap<FString,FString> Tags, TMap<FString,FString> Values)
+{
+	TArray<FString> tags;
 	TArray<FString> values;
-	if (strlen(location_buffer) > 0)
-	{
-		values.Add(FString(ANSI_TO_TCHAR(location_buffer)));
+
+	for(auto &Elem : Tags){
+		tags.Add(Elem.Key + "=" + Elem.Value);
 	}
-	if (strlen(rotation_buffer) > 0)
-	{
-		values.Add(FString(ANSI_TO_TCHAR(rotation_buffer)));
+	for(auto &Elem : Values){
+		values.Add(Elem.Key + "=" + Elem.Value);
 	}
-	if (strlen(scale3d_buffer) > 0)
-	{
-		values.Add(FString(ANSI_TO_TCHAR(scale3d_buffer)));
-	}
-	nanoseconds now = duration_cast <nanoseconds>(system_clock::now().time_since_epoch());
-	FString fs = label + TEXT(" ") + FString::Join(values, TEXT(",")) + TEXT(" ") + FString::Printf(TEXT("%llu"), now.count());
-	return fs;
+	
+	BuildAndAddLineProtocolToBuffer(Label, FString::Join(tags, TEXT(",")), FString::Join(values, TEXT(",")));
 }
 
-FString UInfluxDBUnrealClient::BuildLineProtocol(FString label, FString values)
+void UInfluxDBUnrealClient::PostLineProtocolToInfluxDBServer(FString Lines)
 {
-	return label + " " + values;
-}
-
-void UInfluxDBUnrealClient::BuildAndAddLineProtocolToBuffer(FString label, FString values)
-{
-	AddToLineProtocolBuffer(label + " " + values);
-}
-
-void UInfluxDBUnrealClient::PostLineProtocolToInfluxDBServer(FString lines)
-{
-	int now = FDateTime::Now().ToUnixTimestamp();
+	FString URL = BuildURL();
 	TSharedRef<IHttpRequest, ESPMode::ThreadSafe> HttpRequest = FHttpModule::Get().CreateRequest();
 	if (bPrintDebugToLog)
 	{
-		UE_LOG(LogTemp, Warning, TEXT("Posting %s to %s"), *lines, *UrlAddressAsString);
+		UE_LOG(LogTemp, Warning, TEXT("Posting %s to %s"), *Lines, *URL);
 		HttpRequest->OnProcessRequestComplete().BindUObject(this, &UInfluxDBUnrealClient::OnResponseReceived);
 	}
-	HttpRequest->SetURL(*FString::Printf(TEXT("%s"), *UrlAddressAsString));
+	HttpRequest->SetURL(*FString::Printf(TEXT("%s"), *URL));
 	HttpRequest->SetVerb("POST");
 	HttpRequest->SetHeader(TEXT("User-Agent"), TEXT("X-UnrealEngine-Agent"));
 	HttpRequest->SetHeader("Content-Type", TEXT("application/x-www-form-urlencoded"));
-	HttpRequest->SetContentAsString(lines);
+	if(bUseAuthorization)
+	{
+		if(bInfluxDB2)
+		{
+			FString Auth = TEXT("Token ") + Token;
+			UE_LOG(LogTemp, Warning, TEXT("Auth header: %s"), *Auth)
+			HttpRequest->SetHeader("Authorization", Auth);
+		} else
+		{
+			FString Auth = TEXT("Basic ") + FBase64::Encode(UserName + TEXT(":") + Token);
+			UE_LOG(LogTemp, Warning, TEXT("Auth header: %s"), *Auth)
+			HttpRequest->SetHeader("Authorization", Auth);
+		}
+	} 
+	
+	HttpRequest->SetContentAsString(Lines);	
 	HttpRequest->ProcessRequest();
 }
 
@@ -135,4 +146,22 @@ void UInfluxDBUnrealClient::OnResponseReceived(FHttpRequestPtr Request, FHttpRes
 	}
 }
 
+FString UInfluxDBUnrealClient::BuildURL()
+{
+	FString URL;
+	if(bInfluxDB2)
+	{
+		URL = TEXT("http://") + Host + TEXT(":") + FString::FromInt(Port) + TEXT("/api/v2/write?org=") + OrgName + TEXT("&bucket=") + DBName;
+	} else
+	{
+		// http://165.227.123.141:8086/write?db=unrealanalytics
+		URL = TEXT("http://") + Host + TEXT(":") + FString::FromInt(Port) + TEXT("/write?db=") + DBName;
+	}
+	return URL;
+}
 
+FString UInfluxDBUnrealClient::BuildTimestamp()
+{
+	nanoseconds now = duration_cast <nanoseconds>(system_clock::now().time_since_epoch());
+	return FString::Printf(TEXT("%llu"), now.count());
+}
